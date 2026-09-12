@@ -26,8 +26,10 @@ Usage
 -----
     python graph_memory.py build   [--vault PATH]   # notes -> .graph-memory/graph.db
     python graph_memory.py recall "..."             # what the hook would inject
-    python graph_memory.py status                   # counts, staleness
     python graph_memory.py hook                     # UserPromptSubmit hook (stdin)
+    python graph_memory.py map                      # MAPPING.md: every file, leaf first
+    python graph_memory.py lint                     # dead wikilinks, orphan notes
+    python graph_memory.py status                   # counts, staleness
     python graph_memory.py selftest                 # build + walk a fixture
 
 Credit
@@ -80,7 +82,12 @@ STOP_NAMES = {
 MIN_SEED_LEN = 3
 
 SKIP_DIRS = {".git", ".obsidian", ".trash", STATE_DIRNAME, "node_modules",
-             "__pycache__", ".venv"}
+             "__pycache__"}
+# Pruned during the walk, not filtered after it. Two reasons, both measured: a
+# vault with virtualenvs beside it holds far more .md than the vault itself
+# (40s -> 1s here), and a Linux venv's lib64 symlink makes a plain rglob raise
+# WinError 1920 on Windows before it returns anything at all.
+SKIP_PREFIXES = (".venv",)
 
 SCHEMA = """
 CREATE TABLE entities  (id TEXT PRIMARY KEY,   -- uuid5(type + normalised name)
@@ -189,19 +196,23 @@ def parse_frontmatter(text: str) -> tuple:
 
 def read_notes(vault: Path, scope: str = "") -> dict:
     notes = {}
-    for path in vault.rglob("*.md"):
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
-        rel = path.relative_to(vault).as_posix()
-        if scope and not rel.startswith(scope):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        front, body = parse_frontmatter(text)
-        notes[rel] = Note(rel=rel, stem=path.stem, front=front, body=body,
-                          links=WIKILINK.findall(body))
+    for dirpath, dirnames, filenames in os.walk(vault):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS
+                       and not d.startswith(SKIP_PREFIXES)]
+        for filename in filenames:
+            if not filename.endswith(".md"):
+                continue
+            path = Path(dirpath) / filename
+            rel = path.relative_to(vault).as_posix()
+            if scope and not rel.startswith(scope):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            front, body = parse_frontmatter(text)
+            notes[rel] = Note(rel=rel, stem=path.stem, front=front, body=body,
+                              links=WIKILINK.findall(body))
     return notes
 
 
@@ -214,11 +225,19 @@ def _as_list(value) -> list:
 
 
 def _clean_link(value: str) -> str:
-    """`- "[[Some Page|alias]]"` -> `Some Page`."""
+    """`- "[[Some Page|alias]]"` -> `Some Page`.
+
+    The trailing-backslash strip is not hypothetical: a vault whose notes escape
+    the closing bracket (`[[Some Page\\]]`) produced 1,685 of 1,754 reported
+    dead links here, all of them real notes. The `.md` strip is the same class
+    of bug -- Obsidian resolves `[[note.md]]`, so a linter that does not is
+    reporting its own omission.
+    """
     text = value.strip().strip('"').strip("'")
     m = re.match(r"^\[\[([^\]|#]+)", text)
     text = (m.group(1) if m else text).strip()
-    return text.split("|")[0].split("#")[0].strip()
+    text = text.split("|")[0].split("#")[0]
+    return text.strip().rstrip("\\").strip().removesuffix(".md").strip()
 
 
 def _h1(note: Note) -> str:
@@ -247,6 +266,28 @@ def _description(note: Note) -> str:
     return ""
 
 
+def read_link_targets(vault: Path) -> set:
+    """Lowercase keys for the non-markdown files a wikilink may legally point
+    at -- `[[Wiki Map]]` is a live link when `Wiki Map.canvas` exists. Without
+    this a linter reports every canvas, PDF and image embed as a dead link."""
+    keys = set()
+    for dirpath, dirnames, filenames in os.walk(vault):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS
+                       and not d.startswith(SKIP_PREFIXES)]
+        rel_dir = Path(dirpath).relative_to(vault).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir + "/"
+        for filename in filenames:
+            if filename.endswith(".md"):
+                continue
+            rel = (rel_dir + filename).lower()
+            parts = rel.split("/")
+            for i in range(len(parts)):
+                tail = "/".join(parts[i:])
+                keys.add(tail)
+                keys.add(tail.rsplit(".", 1)[0])  # also without the extension
+    return keys
+
+
 def build_lookup(notes: dict) -> dict:
     """How Obsidian resolves `[[X]]`: by stem, by full path, and by a declared
     alias. A dead link resolves to nothing and is dropped -- never to an
@@ -259,7 +300,13 @@ def build_lookup(notes: dict) -> dict:
     """
     lookup: dict = {}
     for rel, note in notes.items():
-        keys = [note.stem.lower(), rel.lower().removesuffix(".md")]
+        # Every trailing path segment, not just the stem and the full path.
+        # Obsidian resolves `[[concepts/_index]]` against any note whose path
+        # ends that way, and a lookup that only knows "_index" and
+        # "wiki/concepts/_index" calls the link dead. Measured on a real vault:
+        # this one omission reported 8,286 dead links that all resolve fine.
+        parts = rel.lower().removesuffix(".md").split("/")
+        keys = ["/".join(parts[i:]) for i in range(len(parts))]
         keys += [_clean_link(a).lower() for a in _as_list(note.front.get("aliases"))]
         title = str(note.front.get("title") or "").strip().lower()
         if title:
@@ -270,16 +317,43 @@ def build_lookup(notes: dict) -> dict:
     return lookup
 
 
+def _nearest(candidates: list, source_rel: str) -> str:
+    """Obsidian picks the closest note when a short link is ambiguous -- and
+    `[[_index]]` is ambiguous in every vault that has one per folder. Closest
+    here is the longest shared directory prefix, then the shallowest path."""
+    if len(candidates) == 1:
+        return candidates[0]
+    src = source_rel.split("/")[:-1]
+
+    def shared(rel: str) -> int:
+        other = rel.split("/")[:-1]
+        n = 0
+        for a, b in zip(src, other):
+            if a != b:
+                break
+            n += 1
+        return n
+
+    return sorted(candidates, key=lambda r: (-shared(r), r.count("/"), r))[0]
+
+
 # --------------------------------------------------------------------------
 # extraction
 # --------------------------------------------------------------------------
 
-def collect(notes: dict) -> tuple:
-    """Notes -> (nodes, edges, aliases)."""
+def collect(notes: dict, link_targets: set = frozenset()) -> tuple:
+    """Notes -> (nodes, edges, aliases, dead).
+
+    `dead` is every wikilink that resolved to nothing. Building the graph
+    already has to answer "does this link point at a real note", so the dead
+    ones are free -- see `lint`.
+    """
     nodes: dict = {}
     edges: list = []
     aliases: list = []
+    dead: list = []
     lookup = build_lookup(notes)
+    others = link_targets or frozenset()
     taken: dict = {}
 
     def node(name: str, type_: str, desc: str = "", doc: str = "") -> str:
@@ -319,10 +393,12 @@ def collect(notes: dict) -> tuple:
 
     def target_title(raw: str, source_rel: str):
         key = _clean_link(raw).lower()
-        for dest in lookup.get(key, []):
-            if dest in notes:
-                return _title(notes[dest])
-        return None
+        hits = [d for d in lookup.get(key, []) if d in notes]
+        if hits:
+            return _title(notes[_nearest(hits, source_rel)])
+        # Resolves to a canvas/PDF/image: a live link, but not a note, so it
+        # becomes no edge and must not be reported dead either.
+        return "" if key in others else None
 
     # Second pass: edges between notes, resolved the way Obsidian resolves a
     # wikilink, so a dead link is dropped rather than inventing a node.
@@ -333,13 +409,18 @@ def collect(notes: dict) -> tuple:
         for key, predicate in (("related", "related_to"), ("sources", "cites")):
             for raw in _as_list(note.front.get(key)):
                 dest = target_title(raw, rel)
-                if dest and dest != title and (dest, predicate) not in seen:
+                if dest is None:
+                    dead.append((rel, _clean_link(raw), key))
+                elif dest and dest != title and (dest, predicate) not in seen:
                     seen.add((dest, predicate))
                     edges.append({"source": title, "predicate": predicate,
                                   "target": dest, "doc": rel})
 
         for raw in note.links:
             dest = target_title(raw, rel)
+            if dest is None:
+                dead.append((rel, _clean_link(raw), "body"))
+                continue
             if not dest or dest == title:
                 continue
             # An explicit related:/sources: edge is the better-typed one.
@@ -357,7 +438,7 @@ def collect(notes: dict) -> tuple:
                 edges.append({"source": title, "predicate": "part_of",
                               "target": ptitle, "doc": rel})
 
-    return list(nodes.values()), edges, aliases
+    return list(nodes.values()), edges, aliases, dead
 
 
 def write_db(db_file: Path, nodes: list, edges: list, aliases: list) -> dict:
@@ -588,6 +669,89 @@ def recall(db_file: Path, question: str, hops: int = 3, top_k: int = 8) -> Facts
 
 
 # --------------------------------------------------------------------------
+# mapping
+# --------------------------------------------------------------------------
+# MAPPING.md: every file, leaf first, then the folders it sits in.
+#
+#     graph_memory.py > bin > my-vault
+#     Session Cache.md > concepts > wiki > my-vault
+#
+# The question is almost always "where does X live", never "what is in folder
+# Y". A tree answers the second and makes you scan for the first. Sorting by
+# filename and putting the ancestry after it means one grep answers it -- no
+# directory listing, no find, no index lookup, and nothing to run.
+#
+# It holds no content and answers no semantic question. That is the point: it is
+# the cheap lookup that sits under the graph, and the one thing every other
+# lookup needs first -- a path.
+MAP_SKIP_DIRS = SKIP_DIRS | {".pytest_cache", ".ruff_cache", "dist", "build",
+                             ".next", "site-packages"}
+MAP_SKIP_PREFIXES = (".venv",)
+# Assets, skipped unless --all. This file exists to be searched, and nobody
+# searches it for a JPEG.
+ASSET_EXT = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif",
+    ".mp4", ".mov", ".webm", ".mp3", ".wav", ".woff", ".woff2", ".ttf", ".otf",
+    ".zip", ".gz", ".tar", ".exe", ".dll", ".so", ".bin", ".pdf", ".pyc",
+}
+# Collapse a folder holding more than this many files of its own, by size rather
+# than by name, so a new corpus collapses without anyone editing a list.
+# Measured on the vault this came from: the threshold has to count a directory's
+# OWN files, not its subtree -- on the subtree it collapses at the top, and a
+# whole project folder disappears as one line taking everything navigable with
+# it.
+COLLAPSE_OVER = 150
+
+
+def map_rows(vault: Path, include_all: bool = False, scope: str = "") -> tuple:
+    rows, collapsed = [], {}
+    for dirpath, dirnames, filenames in os.walk(vault):
+        dirnames[:] = sorted(d for d in dirnames if d not in MAP_SKIP_DIRS
+                             and not d.startswith(MAP_SKIP_PREFIXES))
+        here = Path(dirpath)
+        rel_dir = here.relative_to(vault).as_posix() if here != vault else ""
+        if scope and rel_dir != scope and not rel_dir.startswith(scope + "/"):
+            if not scope.startswith(rel_dir + "/") and rel_dir:
+                dirnames[:] = []
+            continue
+        keep = [n for n in sorted(filenames)
+                if include_all or Path(n).suffix.lower() not in ASSET_EXT]
+        if not include_all and rel_dir and len(keep) > COLLAPSE_OVER:
+            collapsed[rel_dir] = len(keep)
+            continue
+        parts = rel_dir.split("/") if rel_dir else []
+        ancestry = list(reversed(parts)) + [vault.name]
+        rows.extend((n, ancestry) for n in keep)
+    return rows, collapsed
+
+
+def render_map(rows: list, collapsed: dict, vault_name: str) -> str:
+    lines = [
+        f"# MAPPING — {vault_name}", "",
+        "Every file, leaf first, then the folders it sits in.",
+        "Read `a.md > b > c` as: *a.md is inside b, which is inside c*.", "",
+        "Generated by `graph_memory.py map`. Do not edit by hand.", "",
+        f"**{len(rows):,} files.** Built to be grepped, not read: "
+        "`grep -n \"thing\" MAPPING.md` answers \"where does it live\" in one call.",
+        "",
+    ]
+    if collapsed:
+        lines += [f"Collapsed: folders over {COLLAPSE_OVER} files "
+                  "(pass `--all` to expand):", ""]
+        lines += [f"- `{d}/` — {n:,} files" for d, n in sorted(collapsed.items())]
+        lines.append("")
+    lines += ["---", ""]
+    current = None
+    for name, ancestry in sorted(rows, key=lambda r: (r[0].lower(), r[1])):
+        initial = name[0].upper() if name and name[0].isalnum() else "#"
+        if initial != current:
+            current = initial
+            lines += ["", f"## {initial}", ""]
+        lines.append(f"- `{name}` > " + " > ".join(f"`{p}`" for p in ancestry))
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -608,8 +772,10 @@ def cmd_build(args) -> int:
         print(f"no .md notes under {vault}"
               + (f" matching scope {args.scope!r}" if args.scope else ""))
         return 1
-    nodes, edges, aliases = collect(notes)
+    nodes, edges, aliases, dead = collect(notes, read_link_targets(vault))
     counts = write_db(_db(vault), nodes, edges, aliases)
+    if dead:
+        print(f"note: {len(dead)} dead wikilink(s) dropped — see `lint`")
     print(f"{len(notes)} notes -> {counts['entities']} entities, "
           f"{counts['relations']} relations, {counts['aliases']} aliases "
           f"in {(time.perf_counter() - t0):.1f}s")
@@ -666,6 +832,82 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_map(args) -> int:
+    vault = _vault(args)
+    rows, collapsed = map_rows(vault, args.all, args.scope.strip("/"))
+    if not rows:
+        print(f"no files under {vault}"
+              + (f" matching --scope {args.scope!r}" if args.scope else ""))
+        return 1
+    text = render_map(rows, collapsed, vault.name)
+    if args.stdout:
+        print(text)
+        return 0
+    out = vault / "MAPPING.md"
+    out.write_text(text, encoding="utf-8")
+    print(f"{out}: {len(rows):,} files"
+          + (f", {len(collapsed)} folder(s) collapsed" if collapsed else ""))
+    return 0
+
+
+def cmd_lint(args) -> int:
+    """Dead links and orphans, both free from the graph the build already walks.
+
+    A dead link is a wikilink pointing at a note that does not exist -- Obsidian
+    shows it as a link, the graph drops it, and it is invisible in between.
+    An orphan is a note nothing links to and which links to nothing: it is in
+    the vault but unreachable by any walk, so recall can never surface it.
+    """
+    vault = _vault(args)
+    # Always read the WHOLE vault, then report only the scope. Resolving links
+    # against a subset makes every link that points out of it look dead --
+    # measured on a real vault, scoping the read reported 2,289 dead links whose
+    # targets all existed one folder over.
+    notes = read_notes(vault, "")
+    if not notes:
+        print(f"no .md notes under {vault}")
+        return 1
+    nodes, edges, _aliases, dead = collect(notes, read_link_targets(vault))
+
+    scope = args.scope.strip("/")
+    in_scope = (lambda rel: not scope or rel == scope
+                or rel.startswith(scope + "/"))
+    dead = [d for d in dead if in_scope(d[0])]
+
+    linked = set()
+    for e in edges:
+        linked.add(e["source"])
+        linked.add(e["target"])
+    orphans = sorted(n["source_doc"] for n in nodes
+                     if n["name"] not in linked and n["source_doc"]
+                     and in_scope(n["source_doc"]))
+
+    if dead:
+        print(f"DEAD LINKS ({len(dead)})")
+        for rel, target, where in sorted(dead)[:args.limit]:
+            print(f"  {rel} -> [[{target}]]  ({where})")
+        if len(dead) > args.limit:
+            print(f"  ... {len(dead) - args.limit} more")
+    else:
+        print("DEAD LINKS (0)\n  ok   every wikilink resolves")
+
+    print()
+    if orphans:
+        print(f"ORPHANS ({len(orphans)})")
+        for rel in orphans[:args.limit]:
+            print(f"  {rel}")
+        if len(orphans) > args.limit:
+            print(f"  ... {len(orphans) - args.limit} more")
+    else:
+        print("ORPHANS (0)\n  ok   every note is reachable")
+
+    scoped = sum(1 for rel in notes if in_scope(rel))
+    print(f"\nSUMMARY  {scoped:,} notes"
+          + (f" in {scope}/ (of {len(notes):,} read)" if scope else "")
+          + f" | dead links: {len(dead)} | orphans: {len(orphans)}")
+    return 1 if (dead or orphans) and args.strict else 0
+
+
 FIXTURE = {
     "concepts/Session Cache.md": (
         "---\ntype: concept\nrelated:\n  - \"[[LLM Wiki Pattern]]\"\n---\n"
@@ -696,9 +938,21 @@ def cmd_selftest(args) -> int:
 
         notes = read_notes(vault, "")
         assert len(notes) == 4, f"read {len(notes)} notes, want 4"
-        nodes, edges, aliases = collect(notes)
+        nodes, edges, aliases, dead = collect(notes)
         counts = write_db(_db(vault), nodes, edges, aliases)
         assert counts["relations"] >= 4, counts
+
+        # lint: the fixture's one dead link is found, and nothing else is.
+        assert len(dead) == 1, dead
+        assert dead[0][1] == "Nonexistent Note", dead
+
+        # map: leaf first, ancestry outward to the vault.
+        rows, _collapsed = map_rows(vault)
+        got = {n: a for n, a in rows}
+        assert got["Session Cache.md"] == ["concepts", vault.name], got
+        assert got["log.md"] == [vault.name], got
+        assert "`Session Cache.md` > `concepts` >" in render_map(
+            rows, {}, vault.name)
 
         # Two hops: Session Cache -> LLM Wiki Pattern -> Karpathy Thread. The
         # question never says "Karpathy", so only the walk can reach it.
@@ -750,6 +1004,19 @@ def main() -> int:
     h.add_argument("--hops", type=int, default=3)
     h.add_argument("--top-k", type=int, default=8)
     h.set_defaults(fn=cmd_hook)
+
+    m = sub.add_parser("map", help="MAPPING.md: every file, leaf first")
+    m.add_argument("--all", action="store_true",
+                   help="expand collapsed folders and include assets")
+    m.add_argument("--scope", default="", help="map only this subtree")
+    m.add_argument("--stdout", action="store_true", help="print, do not write")
+    m.set_defaults(fn=cmd_map)
+
+    li = sub.add_parser("lint", help="dead wikilinks and orphan notes")
+    li.add_argument("--scope", default="", help="only lint paths under this prefix")
+    li.add_argument("--limit", type=int, default=20, help="rows per section")
+    li.add_argument("--strict", action="store_true", help="exit 1 on any finding")
+    li.set_defaults(fn=cmd_lint)
 
     sub.add_parser("status", help="counts and staleness").set_defaults(fn=cmd_status)
     sub.add_parser("selftest", help="build and walk a fixture").set_defaults(fn=cmd_selftest)

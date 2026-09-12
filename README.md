@@ -37,6 +37,8 @@ cd obsidian-graph-memory
 python graph_memory.py selftest                     # builds a fixture, walks it, asserts
 python graph_memory.py --vault example-vault build  # 8 notes -> 9 entities, 16 relations
 python graph_memory.py --vault example-vault recall "why does knowledge compound"
+python graph_memory.py --vault example-vault lint    # dead links, orphans
+python graph_memory.py --vault example-vault map --stdout
 ```
 
 Then point it at your own vault:
@@ -76,6 +78,69 @@ behind the notes.
 **It can never fail your turn.** Every path in the hook is wrapped and exits 0.
 A hook that crashes the prompt is worse than a hook that occasionally recalls
 nothing.
+
+## Two more things the graph gives you free
+
+### `map` — find any file in one grep
+
+```
+$ python graph_memory.py --vault ~/my-vault map
+~/my-vault/MAPPING.md: 18,437 files, 22 folder(s) collapsed
+```
+
+`MAPPING.md` lists every file **leaf first**, then the folders it sits in:
+
+```
+- `graph_memory.py` > `bin` > `my-vault`
+- `Session Cache.md` > `concepts` > `wiki` > `my-vault`
+```
+
+The question is almost always *where does X live*, never *what is in folder Y*.
+A tree answers the second and makes you scan for the first. Sorting by filename
+and putting the ancestry after it means one `grep -n "session cache" MAPPING.md`
+answers it — no directory listing, no `find`, no index, and nothing to run. For
+an agent that is one tool call instead of a search loop; `--scope wiki` gives a
+small map when a whole subtree is the question.
+
+Folders holding more than 150 files of their own collapse to a single line, by
+size rather than by name, so a new scraped corpus collapses without anyone
+editing a list. `--all` expands them and includes assets.
+
+### `lint` — dead links and orphans
+
+Building the graph already has to answer *does this link point at a real note*,
+so the broken ones cost nothing extra:
+
+```
+$ python graph_memory.py --vault ~/my-vault lint --scope wiki
+
+DEAD LINKS (49)
+  wiki/concepts/Free Tier Limits.md -> [[https://docs.example.com/...]]  (sources)
+  wiki/concepts/link-syntax.md -> [[wikilinks]]  (body)
+
+ORPHANS (21)
+  wiki/concepts/Stale Draft.md
+
+SUMMARY  2,412 notes in wiki/ (of 17,922 read) | dead links: 49 | orphans: 21
+```
+
+An **orphan** is a note nothing links to that links to nothing: it is in the
+vault but unreachable by any walk, so recall can never surface it. That is the
+one lint finding that matters here — a dead link is cosmetic, an orphan is a
+note the memory cannot see.
+
+Getting this honest took four fixes, each found by running it against a real
+17,922-file vault and disbelieving the number:
+
+| reported | actually |
+| --- | --- |
+| 8,286 dead links | Obsidian resolves *partial paths* (`[[concepts/_index]]`); indexing only stems and full paths called them all dead |
+| 2,289 | scoping the **read** instead of the **report** made every link pointing out of the scope look dead |
+| 1,754 | 1,685 were `[[Note\]]` — an escaped closing bracket the link cleaner kept |
+| 49 | `[[note.md]]` and `[[Wiki Map]]` → `Wiki Map.canvas` are live links too |
+
+A linter whose findings are mostly its own bugs trains you to ignore it, so the
+number is worth chasing to the bottom. `--strict` exits 1 for CI.
 
 ## Why a graph and not embeddings
 
@@ -144,6 +209,8 @@ rather than silently inheriting the first one's facts.
 | command | does |
 | --- | --- |
 | `build` | notes → `.graph-memory/graph.db` (`--scope` to index a subfolder) |
+| `map` | `MAPPING.md`: every file, leaf first (`--scope`, `--all`, `--stdout`) |
+| `lint` | dead wikilinks and orphan notes (`--scope`, `--strict`) |
 | `recall "..."` | what the hook would inject (`--hops`, `--top-k`) |
 | `hook` | `UserPromptSubmit` hook, JSON on stdin |
 | `status` | counts, staleness, busiest nodes |
