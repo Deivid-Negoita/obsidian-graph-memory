@@ -30,6 +30,9 @@ Usage
     python graph_memory.py map                      # MAPPING.md: every file, leaf first
     python graph_memory.py lint                     # dead wikilinks, orphan notes
     python graph_memory.py status                   # counts, staleness
+    python graph_memory.py mcp                      # MCP server on stdio, for agents
+    python graph_memory.py serve                    # HTTP JSON + Prometheus /metrics
+    python graph_memory.py eval evals/x.jsonl       # hit rate, false recalls, p95
     python graph_memory.py selftest                 # build + walk a fixture
 
 Credit
@@ -50,12 +53,16 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import sys
+import threading
 import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 STATE_DIRNAME = ".graph-memory"
 DB_NAME = "graph.db"
@@ -850,6 +857,30 @@ def cmd_map(args) -> int:
     return 0
 
 
+def lint_findings(vault: Path, scope: str = "") -> tuple:
+    """(dead, orphans, notes in scope, notes read) -- `lint` and the MCP tool."""
+    # Always read the WHOLE vault, then report only the scope. Resolving links
+    # against a subset makes every link that points out of it look dead --
+    # measured on a real vault, scoping the read reported 2,289 dead links whose
+    # targets all existed one folder over.
+    notes = read_notes(vault, "")
+    nodes, edges, _aliases, dead = collect(notes, read_link_targets(vault))
+
+    scope = scope.strip("/")
+    in_scope = (lambda rel: not scope or rel == scope
+                or rel.startswith(scope + "/"))
+    dead = sorted(d for d in dead if in_scope(d[0]))
+
+    linked = set()
+    for e in edges:
+        linked.add(e["source"])
+        linked.add(e["target"])
+    orphans = sorted(n["source_doc"] for n in nodes
+                     if n["name"] not in linked and n["source_doc"]
+                     and in_scope(n["source_doc"]))
+    return dead, orphans, sum(1 for rel in notes if in_scope(rel)), len(notes)
+
+
 def cmd_lint(args) -> int:
     """Dead links and orphans, both free from the graph the build already walks.
 
@@ -859,28 +890,11 @@ def cmd_lint(args) -> int:
     the vault but unreachable by any walk, so recall can never surface it.
     """
     vault = _vault(args)
-    # Always read the WHOLE vault, then report only the scope. Resolving links
-    # against a subset makes every link that points out of it look dead --
-    # measured on a real vault, scoping the read reported 2,289 dead links whose
-    # targets all existed one folder over.
-    notes = read_notes(vault, "")
-    if not notes:
+    scope = args.scope.strip("/")
+    dead, orphans, scoped, total = lint_findings(vault, scope)
+    if not total:
         print(f"no .md notes under {vault}")
         return 1
-    nodes, edges, _aliases, dead = collect(notes, read_link_targets(vault))
-
-    scope = args.scope.strip("/")
-    in_scope = (lambda rel: not scope or rel == scope
-                or rel.startswith(scope + "/"))
-    dead = [d for d in dead if in_scope(d[0])]
-
-    linked = set()
-    for e in edges:
-        linked.add(e["source"])
-        linked.add(e["target"])
-    orphans = sorted(n["source_doc"] for n in nodes
-                     if n["name"] not in linked and n["source_doc"]
-                     and in_scope(n["source_doc"]))
 
     if dead:
         print(f"DEAD LINKS ({len(dead)})")
@@ -901,11 +915,303 @@ def cmd_lint(args) -> int:
     else:
         print("ORPHANS (0)\n  ok   every note is reachable")
 
-    scoped = sum(1 for rel in notes if in_scope(rel))
     print(f"\nSUMMARY  {scoped:,} notes"
-          + (f" in {scope}/ (of {len(notes):,} read)" if scope else "")
+          + (f" in {scope}/ (of {total:,} read)" if scope else "")
           + f" | dead links: {len(dead)} | orphans: {len(orphans)}")
     return 1 if (dead or orphans) and args.strict else 0
+
+
+# --------------------------------------------------------------------------
+# serving: MCP for agents, HTTP for services, eval for both
+# --------------------------------------------------------------------------
+# Every way in goes through recall() and the same caps. An agent's tool
+# arguments are model output, so they are untrusted input: hops past 4 reaches
+# most of a real vault, and a 100 kB "question" is a payload, not a question.
+# Clamped rather than rejected -- a tool call that errors costs the agent a
+# turn, one that is trimmed costs it nothing.
+MAX_QUESTION = 2000
+MAX_HOPS = 4
+MAX_TOP_K = 25
+
+
+def _clamp(question, hops=3, top_k=8) -> tuple:
+    return (str(question or "")[:MAX_QUESTION],
+            min(max(int(hops), 0), MAX_HOPS),
+            min(max(int(top_k), 1), MAX_TOP_K))
+
+
+def facts_json(facts: Facts) -> dict:
+    return {"facts": [{"source": s, "predicate": p, "target": t, "doc": d}
+                      for s, p, t, d in facts.triples],
+            "where": dict(facts.notes), "ms": round(facts.ms, 2)}
+
+
+# No tool takes a path and no tool writes. The vault is fixed when the server
+# starts; `scope` only filters what lint reports, and `where` matches names
+# against a walk that cannot leave the vault. That is the whole access-control
+# story, and it is enough because there is nothing else to reach.
+MCP_TOOLS = [
+    {"name": "recall",
+     "description": "Facts from the user's notes about a question: typed edges "
+                    "walked off links the notes' authors wrote, each with the "
+                    "note it came from. Cheap (~ms); call it before searching.",
+     "inputSchema": {"type": "object", "required": ["question"], "properties": {
+         "question": {"type": "string", "maxLength": MAX_QUESTION},
+         "hops": {"type": "integer", "minimum": 0, "maximum": MAX_HOPS},
+         "top_k": {"type": "integer", "minimum": 1, "maximum": MAX_TOP_K}}}},
+    {"name": "where",
+     "description": "Vault-relative paths of files whose name contains a "
+                    "string. One call instead of a directory search.",
+     "inputSchema": {"type": "object", "required": ["name"], "properties": {
+         "name": {"type": "string", "minLength": 2}}}},
+    {"name": "lint",
+     "description": "Dead wikilinks and orphan notes (notes no walk can reach).",
+     "inputSchema": {"type": "object", "properties": {
+         "scope": {"type": "string", "description": "folder prefix to report"}}}},
+]
+
+
+def _call_tool(vault: Path, name: str, args: dict) -> str:
+    if name == "recall":
+        q, hops, top_k = _clamp(args.get("question"), args.get("hops", 3),
+                                args.get("top_k", 8))
+        return recall(_db(vault), q, hops, top_k).as_text()
+    if name == "where":
+        needle = str(args.get("name") or "").strip().lower()[:200]
+        if len(needle) < 2:
+            raise ValueError("name must be at least 2 characters")
+        rows, _collapsed = map_rows(vault, include_all=True)
+        hits = sorted("/".join([*reversed(a[:-1]), n])
+                      for n, a in rows if needle in n.lower())
+        return "\n".join(hits[:30]) or f"no file named like {needle!r}"
+    if name == "lint":
+        dead, orphans, scoped, _total = lint_findings(
+            vault, str(args.get("scope") or ""))
+        lines = [f"{scoped} notes | dead links: {len(dead)} | orphans: {len(orphans)}"]
+        lines += [f"dead: {rel} -> [[{t}]]" for rel, t, _ in dead[:40]]
+        lines += [f"orphan: {rel}" for rel in orphans[:40]]
+        return "\n".join(lines)
+    raise ValueError(f"unknown tool: {name}")
+
+
+def mcp_handle(msg, vault: Path):
+    """One JSON-RPC message in, one reply out -- None for a notification."""
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "invalid request"}}
+    mid, method = msg.get("id"), msg.get("method")
+    if mid is None:  # notifications/initialized, notifications/cancelled
+        return None
+    params = msg.get("params") or {}
+    if method == "initialize":
+        result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "obsidian-graph-memory", "version": "0.2.0"}}
+    elif method == "ping":
+        result = {}
+    elif method == "tools/list":
+        result = {"tools": MCP_TOOLS}
+    elif method == "tools/call":
+        # A failing tool is a result the model can read and recover from, not
+        # a protocol error that ends its turn.
+        try:
+            text = _call_tool(vault, params.get("name"), params.get("arguments") or {})
+            result = {"content": [{"type": "text", "text": text}], "isError": False}
+        except Exception as exc:  # noqa: BLE001
+            result = {"content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
+                      "isError": True}
+    else:
+        return {"jsonrpc": "2.0", "id": mid,
+                "error": {"code": -32601, "message": f"method not found: {method}"}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def cmd_mcp(args) -> int:
+    """MCP over stdio: newline-delimited JSON-RPC. stdout is the protocol, so
+    nothing else may print there."""
+    vault = _vault(args)
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            reply = mcp_handle(json.loads(line), vault)
+        except json.JSONDecodeError:
+            reply = {"jsonrpc": "2.0", "id": None,
+                     "error": {"code": -32700, "message": "parse error"}}
+        if reply is not None:
+            sys.stdout.write(json.dumps(reply) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+class Metrics:
+    """Prometheus text format by hand. Two counters and one histogram do not
+    justify a client library in a file whose rule is stdlib only."""
+
+    BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0)
+    # Label values are a closed set: an unknown path is counted as "other", or
+    # anyone requesting random URLs grows the series without bound.
+    PATHS = ("/recall", "/healthz", "/metrics")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.requests: dict = {}
+        self.buckets = [0] * len(self.BUCKETS)
+        self.count, self.total, self.empty = 0, 0.0, 0
+
+    def request(self, path: str, code: int) -> None:
+        key = (path if path in self.PATHS else "other", code)
+        with self.lock:
+            self.requests[key] = self.requests.get(key, 0) + 1
+
+    def recall(self, seconds: float, empty: bool) -> None:
+        with self.lock:
+            self.count += 1
+            self.total += seconds
+            self.empty += empty
+            for i, edge in enumerate(self.BUCKETS):
+                if seconds <= edge:
+                    self.buckets[i] += 1
+
+    def render(self) -> str:
+        with self.lock:
+            out = ["# TYPE graph_memory_http_requests_total counter"]
+            out += [f'graph_memory_http_requests_total{{path="{p}",code="{c}"}} {n}'
+                    for (p, c), n in sorted(self.requests.items())]
+            out.append("# TYPE graph_memory_recall_seconds histogram")
+            out += [f'graph_memory_recall_seconds_bucket{{le="{b}"}} {n}'
+                    for b, n in zip(self.BUCKETS, self.buckets)]
+            out += [f'graph_memory_recall_seconds_bucket{{le="+Inf"}} {self.count}',
+                    f"graph_memory_recall_seconds_sum {self.total:.6f}",
+                    f"graph_memory_recall_seconds_count {self.count}",
+                    # The quality signal latency cannot show: a recall that is
+                    # fast because it found nothing.
+                    "# TYPE graph_memory_recall_empty_total counter",
+                    f"graph_memory_recall_empty_total {self.empty}"]
+        return "\n".join(out) + "\n"
+
+
+def make_handler(vault: Path, metrics: Metrics):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server's name
+            t0 = time.perf_counter()
+            url = urlsplit(self.path)
+            qs = {k: v[0] for k, v in parse_qs(url.query).items()}
+            rid = self.headers.get("X-Request-Id") or uuid.uuid4().hex[:16]
+            ctype, facts = "application/json", None
+            try:
+                if url.path == "/healthz":
+                    ready = _db(vault).is_file()
+                    code, body = (200 if ready else 503), {"ok": ready}
+                elif url.path == "/metrics":
+                    code, body, ctype = 200, metrics.render(), "text/plain; version=0.0.4"
+                elif url.path == "/recall":
+                    q, hops, top_k = _clamp(qs.get("q"), qs.get("hops", 3),
+                                            qs.get("top_k", 8))
+                    if not q.strip():
+                        code, body = 400, {"error": "missing ?q="}
+                    else:
+                        facts = recall(_db(vault), q, hops, top_k)
+                        metrics.recall(facts.ms / 1000, not facts.triples)
+                        code, body = 200, facts_json(facts)
+                else:
+                    code, body = 404, {"error": "not found"}
+            except ValueError as exc:  # int() on ?hops=abc
+                code, body = 400, {"error": str(exc)}
+            except Exception as exc:  # noqa: BLE001
+                code, body = 500, {"error": "internal", "request_id": rid}
+                print(json.dumps({"request_id": rid, "error": repr(exc)}),
+                      file=sys.stderr)
+            data = (body if isinstance(body, str) else json.dumps(body)).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Request-Id", rid)
+            self.end_headers()
+            self.wfile.write(data)
+            metrics.request(url.path, code)
+            # One JSON line per request: greppable, and shippable to any log
+            # pipeline without a parser. The query text stays out of it.
+            print(json.dumps({"ts": round(time.time(), 3), "request_id": rid,
+                              "path": url.path, "code": code,
+                              "ms": round((time.perf_counter() - t0) * 1000, 2),
+                              "facts": len(facts.triples) if facts else None}),
+                  file=sys.stderr, flush=True)
+
+        def log_message(self, *_args):  # replaced by the JSON line above
+            pass
+
+    return Handler
+
+
+def cmd_serve(args) -> int:
+    vault = _vault(args)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(vault, Metrics()))
+    print(f"serving {vault} on http://{args.host}:{args.port} "
+          "(/recall?q=  /healthz  /metrics)", file=sys.stderr, flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def evaluate(db_file: Path, cases: list, top_k: int = 8) -> dict:
+    """Score recall against questions with known answers.
+
+    A case is {"q": ..., "expect": [entity, ...]}. An empty `expect` is a
+    question the vault has no answer to, and recalling anything for it is a
+    false recall -- the failure an agent pays for most, because confident
+    unrelated context is worse than none.
+    """
+    rows, lat, recalls, hits, positives, false, negatives = [], [], [], 0, 0, 0, 0
+    for case in cases:
+        facts = recall(db_file, case["q"], top_k=top_k)
+        lat.append(facts.ms)
+        got = {n.lower() for s, _, t, _ in facts.triples for n in (s, t)}
+        want = [w.lower() for w in case.get("expect", [])]
+        if want:
+            found = sum(w in got for w in want)
+            positives += 1
+            hits += found > 0
+            recalls.append(found / len(want))
+            ok = found == len(want)
+            missing = [w for w in want if w not in got]
+        else:
+            negatives += 1
+            false += bool(facts.triples)
+            ok, missing = not facts.triples, []
+        rows.append({"q": case["q"], "ok": ok, "missing": missing,
+                     "facts": len(facts.triples), "ms": round(facts.ms, 2)})
+    lat.sort()
+    return {"cases": rows,
+            "hit_rate": hits / positives if positives else 1.0,
+            "entity_recall": statistics.mean(recalls) if recalls else 1.0,
+            "false_recall": false / negatives if negatives else 0.0,
+            "p50_ms": statistics.median(lat) if lat else 0.0,
+            "p95_ms": lat[min(len(lat) - 1, int(0.95 * len(lat)))] if lat else 0.0}
+
+
+def cmd_eval(args) -> int:
+    with open(args.gold, encoding="utf-8") as fh:
+        cases = [json.loads(line) for line in fh if line.strip()]
+    report = evaluate(_db(_vault(args)), cases, args.top_k)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        for row in report["cases"]:
+            mark = "ok  " if row["ok"] else "MISS"
+            extra = f"  missing: {', '.join(row['missing'])}" if row["missing"] else ""
+            print(f"{mark} {row['ms']:6.1f} ms  {row['facts']:2d} facts  {row['q']}{extra}")
+        print(f"\nhit rate {report['hit_rate']:.0%} | entity recall "
+              f"{report['entity_recall']:.0%} | false recall {report['false_recall']:.0%}"
+              f" | p50 {report['p50_ms']:.1f} ms | p95 {report['p95_ms']:.1f} ms"
+              f" | {len(cases)} cases")
+    failed = (report["hit_rate"] < args.min_hit
+              or report["false_recall"] > args.max_false)
+    return 1 if failed else 0
 
 
 FIXTURE = {
@@ -978,6 +1284,56 @@ def cmd_selftest(args) -> int:
         # ...without seeding on everything: an unrelated question stays empty.
         assert not recall(_db(vault), "what time is dinner").triples
 
+        # MCP: the handshake, a call, and the two ways a call goes wrong.
+        def rpc(method, params=None, mid=1):
+            return mcp_handle({"jsonrpc": "2.0", "id": mid, "method": method,
+                               "params": params or {}}, vault)
+        assert rpc("initialize")["result"]["capabilities"] == {"tools": {}}
+        assert mcp_handle({"jsonrpc": "2.0",
+                           "method": "notifications/initialized"}, vault) is None
+        tools = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
+        assert tools == ["recall", "where", "lint"], tools
+        call = rpc("tools/call", {"name": "recall", "arguments": {
+            "question": "what is the session cache", "hops": 99}})["result"]
+        assert not call["isError"] and "Karpathy Thread" in call["content"][0]["text"]
+        assert rpc("tools/call", {"name": "rm", "arguments": {}})["result"]["isError"]
+        where = rpc("tools/call", {"name": "where", "arguments": {"name": "cache"}})
+        assert where["result"]["content"][0]["text"] == "concepts/Session Cache.md", where
+        assert rpc("resources/list")["error"]["code"] == -32601
+        assert _clamp("x" * 5000, 99, 0) == ("x" * MAX_QUESTION, MAX_HOPS, 1)
+
+        # eval: a known answer hits, an unanswerable question recalls nothing.
+        report = evaluate(_db(vault), [
+            {"q": "what is the session cache",
+             "expect": ["Session Cache", "Karpathy Thread"]},
+            {"q": "what time is dinner", "expect": []}])
+        assert report["hit_rate"] == 1.0 and report["false_recall"] == 0.0, report
+
+        # HTTP, over a real socket: recall, then the metrics that recall moved.
+        import urllib.error
+        import urllib.request
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(vault, Metrics()))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with urllib.request.urlopen(base + "/recall?q=session+cache") as resp:
+                body = json.load(resp)
+            assert any(f["target"] == "LLM Wiki Pattern" for f in body["facts"]), body
+            try:
+                urllib.request.urlopen(base + "/random-path-123")
+                raise AssertionError("unknown path served")
+            except urllib.error.HTTPError as err:
+                assert err.code == 404, err.code
+            with urllib.request.urlopen(base + "/metrics") as resp:
+                text = resp.read().decode()
+            assert "graph_memory_recall_seconds_count 1" in text, text
+            assert 'path="/recall",code="200"} 1' in text, text
+            # The probed path is folded into "other", never its own series.
+            assert 'path="other",code="404"} 1' in text, text
+        finally:
+            server.shutdown()
+            server.server_close()
+
         print(rendered)
         print("\nselftest: ok")
     return 0
@@ -1019,6 +1375,23 @@ def main() -> int:
     li.set_defaults(fn=cmd_lint)
 
     sub.add_parser("status", help="counts and staleness").set_defaults(fn=cmd_status)
+    sub.add_parser("mcp", help="MCP server on stdio (recall, where, lint)"
+                   ).set_defaults(fn=cmd_mcp)
+
+    s = sub.add_parser("serve", help="HTTP: /recall?q=, /healthz, /metrics")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
+    s.set_defaults(fn=cmd_serve)
+
+    e = sub.add_parser("eval", help="score recall against a gold JSONL file")
+    e.add_argument("gold", help='JSONL: {"q": "...", "expect": ["Entity", ...]}')
+    e.add_argument("--top-k", type=int, default=8)
+    e.add_argument("--min-hit", type=float, default=0.0,
+                   help="exit 1 below this hit rate (CI gate)")
+    e.add_argument("--max-false", type=float, default=1.0,
+                   help="exit 1 above this false-recall rate (CI gate)")
+    e.add_argument("--json", action="store_true")
+    e.set_defaults(fn=cmd_eval)
     sub.add_parser("selftest", help="build and walk a fixture").set_defaults(fn=cmd_selftest)
 
     args = ap.parse_args()

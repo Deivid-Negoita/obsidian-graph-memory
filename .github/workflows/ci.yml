@@ -1,0 +1,35 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python graph_memory.py selftest
+      - run: python graph_memory.py --vault example-vault build
+      - run: python graph_memory.py --vault example-vault lint --strict
+      # Recall quality is a gate, not a number in a README: a ranking change
+      # that loses an answer or starts recalling for unanswerable questions fails.
+      - run: python graph_memory.py --vault example-vault eval evals/example-vault.jsonl --min-hit 1.0 --max-false 0
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python graph_memory.py --vault example-vault build
+      - run: docker build -t graph-memory .
+      - run: docker run -d --name gm -p 8765:8765 -v "$PWD/example-vault:/vault:ro" graph-memory
+      - run: |
+          for i in $(seq 20); do curl -fs localhost:8765/healthz && break; sleep 0.5; done
+          curl -fs "localhost:8765/recall?q=why+does+knowledge+compound" | grep -q "Compounding Knowledge"
+          curl -fs localhost:8765/metrics | grep -q "graph_memory_recall_seconds_count 1"
+      - if: always()
+        run: docker logs gm

@@ -1,0 +1,11 @@
+{"q": "how is a wiki different from RAG", "expect": ["LLM Wiki Pattern", "Retrieval Augmented Generation"]}
+{"q": "why does knowledge compound", "expect": ["Compounding Knowledge"]}
+{"q": "what is a session cache", "expect": ["Session Cache", "LLM Wiki Pattern"]}
+{"q": "who named the wiki pattern", "expect": ["Karpathy Thread"]}
+{"q": "what does sqlite do in this setup", "expect": ["SQLite", "Graph Recall"]}
+{"q": "why can obsidian notes be walked as a graph", "expect": ["Obsidian", "Graph Recall"]}
+{"q": "is graph recall better than embeddings", "expect": ["Graph Recall", "Retrieval Augmented Generation"]}
+{"q": "what does RAG get wrong", "expect": ["Retrieval Augmented Generation"]}
+{"q": "what time is dinner", "expect": []}
+{"q": "how do I bake sourdough bread", "expect": []}
+{"q": "which football team won the league", "expect": []}

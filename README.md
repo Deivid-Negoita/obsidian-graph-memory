@@ -6,7 +6,12 @@ of a search session that grows with the vault.
 It reads a folder of Obsidian markdown, walks the links you already wrote into a
 SQLite graph, and injects the relevant facts into the prompt *before* the model
 is invoked — as a [Claude Code](https://claude.com/claude-code)
-`UserPromptSubmit` hook, or as a CLI you can pipe anywhere.
+`UserPromptSubmit` hook, as an **MCP server** any agent can call, as an **HTTP
+service** with Prometheus metrics, or as a CLI you can pipe anywhere. An `eval`
+command scores recall against questions with known answers, and CI fails the
+build when a ranking change loses one.
+
+[![ci](https://github.com/Deivid-Negoita/obsidian-graph-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Deivid-Negoita/obsidian-graph-memory/actions/workflows/ci.yml)
 
 Stdlib Python only. No dependencies, no vector database, no embedding model, and
 no model call anywhere in the retrieval path.
@@ -78,6 +83,83 @@ behind the notes.
 **It can never fail your turn.** Every path in the hook is wrapped and exits 0.
 A hook that crashes the prompt is worse than a hook that occasionally recalls
 nothing.
+
+## Give it to any agent: MCP
+
+The hook decides *for* the model what it remembers. An MCP server lets the
+model ask, mid-task, as often as it needs:
+
+```json
+{
+  "mcpServers": {
+    "graph-memory": {
+      "command": "python",
+      "args": ["/path/to/graph_memory.py", "--vault", "/path/to/vault", "mcp"]
+    }
+  }
+}
+```
+
+| tool | returns |
+| --- | --- |
+| `recall(question, hops?, top_k?)` | the same facts the hook injects |
+| `where(name)` | vault-relative paths of files whose name contains `name` |
+| `lint(scope?)` | dead wikilinks and orphan notes |
+
+JSON-RPC over stdio, no SDK. Tool arguments are model output, so they are
+treated as untrusted input: `hops` is clamped to 4, `top_k` to 25, the question
+to 2,000 characters. No tool takes a path and no tool writes, so the vault the
+server was started on is the only thing it can read. A failing tool comes back
+as `isError` the model can read and recover from, not a protocol error that
+ends its turn.
+
+## Run it as a service: HTTP + metrics
+
+```bash
+python graph_memory.py --vault ~/my-vault serve          # 127.0.0.1:8765
+curl "localhost:8765/recall?q=why+does+knowledge+compound"
+```
+
+| endpoint | does |
+| --- | --- |
+| `GET /recall?q=&hops=&top_k=` | facts as JSON, each with its source note |
+| `GET /healthz` | 200 when a graph is built, 503 when not |
+| `GET /metrics` | Prometheus: requests by path and code, recall latency histogram, empty recalls |
+
+Every request logs one JSON line to stderr — request id, path, status, latency,
+fact count, never the query text — and echoes `X-Request-Id` so a caller can
+correlate. `graph_memory_recall_empty_total` is the counter worth alerting on:
+latency cannot tell a fast answer from a fast nothing. Unknown paths are
+counted as `other`, so a scanner probing URLs cannot grow the series without
+bound.
+
+In a container, read-only and as `nobody`:
+
+```bash
+python graph_memory.py --vault ~/my-vault build
+docker build -t graph-memory .
+docker run -p 8765:8765 -v ~/my-vault:/vault:ro graph-memory
+```
+
+## Measure it: `eval`
+
+A ranking tweak that helps one question quietly breaks another, so recall
+quality is a test, not an impression. A gold file is one JSON object per line;
+an empty `expect` is a question the vault cannot answer, where recalling
+*anything* is a failure — confident unrelated context is worse than none.
+
+```
+$ python graph_memory.py --vault example-vault eval evals/example-vault.jsonl
+
+ok      1.1 ms   8 facts  why does knowledge compound
+ok      1.2 ms   8 facts  who named the wiki pattern
+ok      0.5 ms   0 facts  what time is dinner
+...
+hit rate 100% | entity recall 100% | false recall 0% | p50 1.2 ms | p95 4.0 ms | 11 cases
+```
+
+`--min-hit` and `--max-false` turn it into a gate; CI runs it on Linux and
+Windows, Python 3.9 and 3.13, then boots the container and curls it.
 
 ## Two more things the graph gives you free
 
@@ -214,12 +296,16 @@ rather than silently inheriting the first one's facts.
 | `recall "..."` | what the hook would inject (`--hops`, `--top-k`) |
 | `hook` | `UserPromptSubmit` hook, JSON on stdin |
 | `status` | counts, staleness, busiest nodes |
-| `selftest` | builds a fixture and asserts the things that actually break |
+| `mcp` | MCP server on stdio: `recall`, `where`, `lint` |
+| `serve` | HTTP: `/recall`, `/healthz`, `/metrics` (`--host`, `--port`) |
+| `eval gold.jsonl` | hit rate, entity recall, false recall, p50/p95 (`--min-hit`, `--max-false`, `--json`) |
+| `selftest` | builds a fixture and asserts the things that actually break, MCP and HTTP included |
 
 ## Credit
 
 Schema, `WALK` query and seeding rule: **Glitch-Cat-Club/graph-memory-starter**
-(MIT). Extraction, ranking, word seeding and the hook: this repo.
+(MIT). Extraction, ranking, word seeding, the hook, the MCP server, the HTTP
+service and the eval: this repo.
 
 Extracted from a larger personal Obsidian vault where it runs on every prompt.
 
